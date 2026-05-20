@@ -1,0 +1,406 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+"""
+Billing Support Assistant — AI layer (OpenAI-powered, multi-agent architecture)
+
+Automatically generated from Colab notebook.
+
+Agents:
+  1. Orchestrator Agent   — understands the billing question, calls data tools
+  2. Billing Analyst Agent — produces a structured billing situation report
+  3. Care Message Agent    — drafts a professional support response / message
+
+Tools (function-calling):
+  - get_customer_billing_data    : full billing snapshot for a customer
+  - get_invoice_items            : line-item breakdown for an invoice
+  - get_overdue_customers_data   : list of all overdue customers
+  - run_billing_sql              : ad-hoc SQL against the billing tables
+"""
+
+import json
+import os
+import re
+from typing import Any
+
+from db import ZainDB
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None  # handled at call time
+
+# Module-level singleton used by _dispatch_tool
+db = ZainDB()
+
+MODEL = "gpt-4o"
+
+
+# ── Client factory ─────────────────────────────────────────────────────────────
+
+def get_client(api_key: str = "") -> "OpenAI":
+    if OpenAI is None:
+        raise RuntimeError("openai package not installed. Run: pip install openai")
+    key = api_key.strip() or os.environ.get("OPENAI_API_KEY", "")
+    if not key:
+        raise ValueError("OpenAI API key is required.")
+    return OpenAI(api_key=key)
+
+
+def _chat(client, system: str, messages: list[dict], tools=None, max_tokens=1200) -> str:
+    """Single completion call; handles tool loops when tools are provided."""
+    kwargs: dict[str, Any] = dict(model=MODEL, max_tokens=max_tokens,
+                                   messages=[{"role": "system", "content": system}] + messages)
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+    try:
+        resp = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        return f"⚠️ AI error: {e}"
+
+    msg = resp.choices[0].message
+
+    # If no tool calls, return text directly
+    if not (tools and msg.tool_calls):
+        return msg.content or ""
+
+    # ── Tool execution loop ───────────────────────────────────────────────────
+    messages = messages + [msg]
+
+    for tc in msg.tool_calls:
+        fn_name = tc.function.name
+        fn_args = json.loads(tc.function.arguments)
+        result = _dispatch_tool(fn_name, fn_args)
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": json.dumps(result, default=str),
+        })
+
+    # Final completion after tool results
+    final = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        messages=[{"role": "system", "content": system}] + messages,
+    )
+    return final.choices[0].message.content or ""
+
+
+# ── Tool dispatcher ────────────────────────────────────────────────────────────
+
+def _dispatch_tool(name: str, args: dict) -> Any:
+    if name == "get_customer_billing_data":
+        cid = int(args["customer_id"])
+        profile = db.get_customer_profile(cid)
+        account = db.get_customer_account(cid)
+        billing = db.get_billing_details(cid)
+        churn = db.get_customer_churn(cid)
+        value = db.get_customer_value(cid)
+        inv_df = billing.get("invoices", None)
+        return {
+            "profile": profile,
+            "account": account,
+            "billing_summary": billing.get("billing_summary", {}),
+            "payment_summary": billing.get("payment_summary", {}),
+            "recent_invoices": inv_df.to_dict("records") if inv_df is not None and not inv_df.empty else [],
+            "churn": churn,
+            "value": value,
+        }
+
+    if name == "get_invoice_items":
+        invoice_id = int(args["invoice_id"])
+        df = db.get_invoice_items_detail(invoice_id)
+        return df.to_dict("records") if not df.empty else []
+
+    if name == "get_overdue_customers_data":
+        limit = int(args.get("limit", 20))
+        df = db.get_overdue_customers(limit)
+        return df.to_dict("records") if not df.empty else []
+
+    if name == "run_billing_sql":
+        sql = args.get("sql", "")
+        try:
+            df = db.run_sql(sql)
+            return df.head(30).to_dict("records")
+        except Exception as e:
+            return {"error": str(e)}
+
+    return {"error": f"Unknown tool: {name}"}
+
+
+# ── Tool schemas ───────────────────────────────────────────────────────────────
+
+BILLING_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_customer_billing_data",
+            "description": "Retrieve full billing snapshot for a customer: invoices, payments, account, churn score, and value segment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer_id": {"type": "integer", "description": "The Zain Jordan customer ID (1–1000)"}
+                },
+                "required": ["customer_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_invoice_items",
+            "description": "Get the line-item breakdown (charges) for a specific invoice.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "invoice_id": {"type": "integer", "description": "The invoice ID to inspect"}
+                },
+                "required": ["invoice_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_overdue_customers_data",
+            "description": "Retrieve a list of customers with overdue invoices, sorted by overdue amount.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max number of customers to return (default 20)"}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_billing_sql",
+            "description": "Run a custom SQL query against the Zain Jordan billing database (read-only).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "SELECT SQL query to execute"}
+                },
+                "required": ["sql"],
+            },
+        },
+    },
+]
+
+
+# ── Agent 1: Billing Analyst ───────────────────────────────────────────────────
+
+BILLING_ANALYST_SYSTEM = """You are a senior Billing Support Analyst at Zain Jordan, a leading telecom operator in Jordan.
+
+Your job is to analyze a customer's complete billing situation and produce a clear, structured report for the support team.
+
+When you receive a request, use the available tools to fetch data, then produce a report with these sections:
+
+## 📋 Customer Overview
+Brief profile: name, city, segment, account status.
+
+## 🧾 Billing Situation
+- Total billed vs total paid
+- Overdue invoices (count, amounts, how many days overdue)
+- Payment behavior: on-time, late, or problematic
+- Recent invoice breakdown
+
+## ⚠️ Issues & Flags
+- Any billing disputes or complaints
+- Unusual charges (roaming, penalties, etc.)
+- Credit limit concerns
+
+## 💡 Root Cause Analysis
+What is driving the billing confusion or overdue situation?
+
+## ✅ Recommended Support Actions
+3–4 specific, actionable steps for the support agent to take right now.
+
+## 💬 Suggested Customer Communication
+1-sentence summary of what to tell the customer.
+
+Be concise, data-driven, and practical. Use markdown formatting."""
+
+
+def analyze_billing_situation(customer_id: int, api_key: str = "") -> str:
+    """Agent 1: Full billing analysis for a customer using tool calls."""
+    client = get_client(api_key)
+    messages = [{
+        "role": "user",
+        "content": f"Analyze the complete billing situation for Zain Jordan customer ID {customer_id}. "
+                   f"Fetch all relevant data using tools and produce a structured billing support report.",
+    }]
+    return _chat(client, BILLING_ANALYST_SYSTEM, messages, tools=BILLING_TOOLS, max_tokens=1400)
+
+
+# ── Agent 2: Care Message Agent ────────────────────────────────────────────────
+
+CARE_MESSAGE_SYSTEM = """You are a Customer Care Communication Specialist at Zain Jordan.
+
+Your role is to draft warm, professional, empathetic messages for the billing support team to send to customers.
+
+Guidelines:
+- Be respectful and empathetic — billing issues are stressful for customers
+- Be specific about the issue and the solution offered
+- Include a clear call-to-action
+- Keep SMS under 160 characters; email 150–200 words
+- Match the customer's preferred language (Arabic or English)
+- Represent Zain Jordan's brand: professional, caring, helpful"""
+
+
+def generate_billing_support_response(customer_data: dict, billing_context: str, api_key: str = "") -> str:
+    """Agent 2: Draft a professional support response for the customer."""
+    client = get_client(api_key)
+    name = customer_data.get("full_name", "Valued Customer")
+    language = customer_data.get("preferred_language", "English")
+    lang_note = "Write in Arabic." if language == "Arabic" else "Write in English."
+
+    messages = [{
+        "role": "user",
+        "content": f"""Draft a billing support message for this Zain Jordan customer.
+
+{lang_note}
+
+Customer: {name} (ID: {customer_data.get('customer_id', 'N/A')})
+City: {customer_data.get('city', 'N/A')}
+Issue context:
+{billing_context}
+
+Please produce:
+
+**📱 SMS/WhatsApp Message (max 160 chars):**
+[message]
+
+**📧 Email Message:**
+Subject: [subject]
+[body — 150-200 words, empathetic and clear with next steps]
+
+**🗣️ Call Script Opening (2-3 sentences for agent to read when calling customer):**
+[script]""",
+    }]
+    return _chat(client, CARE_MESSAGE_SYSTEM, messages, max_tokens=800)
+
+
+# ── Orchestrator Agent ─────────────────────────────────────────────────────────
+
+ORCHESTRATOR_SYSTEM = """You are the Billing Support Orchestrator at Zain Jordan.
+
+You coordinate the billing support team by:
+1. Understanding what the user is asking about billing
+2. Fetching necessary data using tools
+3. Providing a direct, helpful answer
+
+Use the tools to get real data before answering. Always base your response on actual database records.
+
+Format your response clearly with markdown. Be specific with amounts (JOD), dates, and invoice IDs."""
+
+
+def run_billing_agent(question: str, api_key: str = "") -> str:
+    """Orchestrator: handles any free-form billing question with tool access."""
+    client = get_client(api_key)
+    messages = [{"role": "user", "content": question}]
+    return _chat(client, ORCHESTRATOR_SYSTEM, messages, tools=BILLING_TOOLS, max_tokens=1200)
+
+
+# ── Overdue Dashboard Analysis ─────────────────────────────────────────────────
+
+def analyze_overdue_dashboard(overdue_data: str, api_key: str = "") -> str:
+    """Analyze the overdue customers dashboard and suggest collection priorities."""
+    client = get_client(api_key)
+    system = (
+        "You are a Revenue Assurance Manager at Zain Jordan. "
+        "Analyze overdue billing data and recommend collection priorities and strategies."
+    )
+    messages = [{
+        "role": "user",
+        "content": f"""Analyze this overdue customer data and provide:
+
+1. **Portfolio Summary** — total exposure, average days overdue
+2. **Priority Segments** — which customers to contact first and why
+3. **Collection Strategy** — recommended approach (payment plans, waivers, escalation)
+4. **Quick Wins** — customers likely to pay with a single reminder
+
+Overdue data:
+{overdue_data}
+
+Keep it under 350 words, focused and actionable.""",
+    }]
+    return _chat(client, system, messages, max_tokens=600)
+
+
+# ── SQL Insight Agent ──────────────────────────────────────────────────────────
+
+def interpret_billing_query(question: str, sql_result: str, api_key: str = "") -> str:
+    """Interpret SQL results in a billing business context."""
+    client = get_client(api_key)
+    system = (
+        "You are a Billing Business Intelligence Analyst at Zain Jordan. "
+        "Interpret SQL query results and give billing-focused business insights. "
+        "Use markdown formatting."
+    )
+    messages = [{
+        "role": "user",
+        "content": f"Business question: {question}\n\nSQL result:\n{sql_result}\n\n"
+                   "Provide clear billing insights and recommended actions.",
+    }]
+    return _chat(client, system, messages, max_tokens=500)
+
+
+# ── Payment Reminder Generator ─────────────────────────────────────────────────
+
+def generate_payment_reminder(customer_data: dict, overdue_amount: float,
+                               days_overdue: int, api_key: str = "") -> str:
+    """Generate a targeted payment reminder based on overdue severity."""
+    client = get_client(api_key)
+    name = customer_data.get("full_name", "Valued Customer")
+    language = customer_data.get("preferred_language", "English")
+    lang_note = "Write in Arabic." if language == "Arabic" else "Write in English."
+    tone = "urgent and firm but respectful" if days_overdue > 30 else "friendly and helpful"
+
+    system = (
+        "You are a billing collections specialist at Zain Jordan. "
+        "Write effective payment reminder messages that maintain the customer relationship "
+        "while clearly communicating the urgency of payment."
+    )
+    messages = [{
+        "role": "user",
+        "content": f"""Write a payment reminder for this customer.
+
+{lang_note} Tone: {tone}
+
+Customer: {name}
+Overdue amount: JOD {overdue_amount:.2f}
+Days overdue: {days_overdue}
+Value segment: {customer_data.get('value_segment', 'N/A')}
+
+Produce:
+**SMS Reminder (max 160 chars):**
+[message]
+
+**WhatsApp/Email Reminder:**
+[150 words max — include amount, payment options, deadline, and consequence if not paid]""",
+    }]
+    return _chat(client, system, messages, max_tokens=600)
+
+
+# ── Executive Billing Summary ──────────────────────────────────────────────────
+
+def generate_billing_executive_summary(kpis: dict, api_key: str = "") -> str:
+    """Generate an executive summary of the billing portfolio health."""
+    client = get_client(api_key)
+    system = (
+        "You are a CFO assistant at Zain Jordan preparing a billing health briefing. "
+        "Be concise, data-driven, and flag what needs immediate finance/collections attention."
+    )
+    messages = [{
+        "role": "user",
+        "content": f"""Create a 5-bullet executive billing summary from these KPIs.
+End with 2 immediate action items for the billing team.
+
+KPIs:
+{json.dumps(kpis, indent=2, default=str)}""",
+    }]
+    return _chat(client, system, messages, max_tokens=400)
+
